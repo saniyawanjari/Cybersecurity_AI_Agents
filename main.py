@@ -1,32 +1,37 @@
-"""Supervisor (Phase 2): Autonomous Agent Authorization Framework.
-
-Intercepts all agent requests and enforces capability-based access control.
-Before any agent action is executed:
-  1. Validates the agent role from the x-agent-role header (fail-closed if missing).
-  2. Queries Open Policy Agent (OPA) at http://localhost:8181/v1/data/authz/allow.
-  3. Denies any request if OPA is unreachable (503) or if not explicitly allowed (403).
-  4. Dispatches the action to simulated SOC tools only upon approval.
-"""
+"""Supervisor: Capability-Based Autonomous Agent Authorization Framework with Audit Log."""
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import ipaddress
 import os
-from typing import Optional
+from typing import Optional, List
 
-import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 import agent_a
 import agent_b
+import audit
+from config import settings
+from db import get_db, init_db
+from models import AuditLog, RevokedToken
 import soc_tools
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database tables on application startup."""
+    init_db()
+    yield
+
 
 app = FastAPI(
     title="SOC Agent Framework Supervisor",
-    version="phase-2",
-    description="Capability-based supervisor for autonomous cybersecurity agents."
+    version="phase-5",
+    description="Capability-based supervisor for autonomous cybersecurity agents with tamper-evident audit logging.",
+    lifespan=lifespan,
 )
-
-# OPA URL configured via environment variable with localhost fallback
-OPA_URL = os.getenv("OPA_URL", "http://localhost:8181/v1/data/authz/allow")
 
 
 class BlockRequest(BaseModel):
@@ -37,79 +42,89 @@ class IsolateRequest(BaseModel):
     host: str
 
 
-def authorize(role: Optional[str], action: str, resource: str) -> None:
-    """Evaluate authorization against OPA policy.
-    
-    Fail closed:
-      - Missing or empty role header -> 403 Forbidden
-      - OPA unreachable, connection error, or timeout (>2s) -> 503 Service Unavailable
-      - OPA decision not exactly True -> 403 Forbidden
-    """
-    if not role or not role.strip():
-        raise HTTPException(
-            status_code=403,
-            detail="Authorization denied: missing or empty 'x-agent-role' header"
-        )
+class RevokeTokenRequest(BaseModel):
+    jti: str
 
-    try:
-        response = httpx.post(
-            OPA_URL,
-            json={"input": {"role": role.strip(), "action": action, "resource": resource}},
-            timeout=2.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        allowed = data.get("result")
-    except (httpx.HTTPError, ValueError):
-        # Network error, timeout, non-2xx status, or malformed JSON
-        raise HTTPException(
-            status_code=503,
-            detail="Policy engine (OPA) unavailable - request denied (fail closed)"
-        )
 
-    if allowed is not True:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Access denied by policy: role '{role}' cannot perform '{action}' on '{resource}'"
-        )
+def require_admin(x_admin_key: Optional[str] = Header(default=None)):
+    """Enforce admin authorization using x-admin-key header."""
+    if not x_admin_key or x_admin_key != settings.ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing admin key")
+    return x_admin_key
+
+
+# =====================================================================
+# Agent Endpoints (Protected by Supervisor OPA Enforcement & Audit Log)
+# =====================================================================
 
 
 @app.get("/api/v1/agent-a/report")
-def get_agent_a_report(x_agent_role: Optional[str] = Header(default=None)):
-    """Agent A - Log Analyst report endpoint.
-    
-    Requires permission: 'read_logs' on 'server_logs.txt'.
-    """
-    authorize(x_agent_role, "read_logs", "server_logs.txt")
-    return agent_a.analyze_logs()
+def get_agent_a_report(
+    response: Response,
+    x_agent_role: Optional[str] = Header(default=None),
+    x_agent_did: Optional[str] = Header(default=None),
+    x_token_jti: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Agent A - Log Analyst report endpoint. Requires 'read_logs' on 'server_logs.txt'."""
+    decision_ms = audit.enforce(
+        db=db,
+        role=x_agent_role,
+        action="read_logs",
+        resource="server_logs.txt",
+        agent_did=x_agent_did,
+        token_jti=x_token_jti,
+        auth_header=authorization,
+    )
+    response.headers["X-Decision-Time-ms"] = f"{decision_ms:.2f}"
+    return agent_a.analyze_logs() if hasattr(agent_a, "analyze_logs") else agent_a.run_analysis()
 
 
 @app.get("/api/v1/agent-b/threats")
-def get_agent_b_threats(x_agent_role: Optional[str] = Header(default=None)):
-    """Agent B - Threat Detector threats endpoint.
-    
-    Requires BOTH permissions:
-      1. 'read_logs' on 'server_logs.txt'
-      2. 'report_threat' on 'threats'
-    """
-    authorize(x_agent_role, "read_logs", "server_logs.txt")
-    authorize(x_agent_role, "report_threat", "threats")
-    
-    report = agent_a.analyze_logs()
+def get_agent_b_threats(
+    response: Response,
+    x_agent_role: Optional[str] = Header(default=None),
+    x_agent_did: Optional[str] = Header(default=None),
+    x_token_jti: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Agent B - Threat Detector threats endpoint. Requires read_logs and report_threat."""
+    d1 = audit.enforce(
+        db=db,
+        role=x_agent_role,
+        action="read_logs",
+        resource="server_logs.txt",
+        agent_did=x_agent_did,
+        token_jti=x_token_jti,
+        auth_header=authorization,
+    )
+    d2 = audit.enforce(
+        db=db,
+        role=x_agent_role,
+        action="report_threat",
+        resource="threats",
+        agent_did=x_agent_did,
+        token_jti=x_token_jti,
+        auth_header=authorization,
+    )
+    response.headers["X-Decision-Time-ms"] = f"{(d1 + d2):.2f}"
+    report = agent_a.analyze_logs() if hasattr(agent_a, "analyze_logs") else agent_a.run_analysis()
     return agent_b.detect_threats(report)
 
 
 @app.post("/api/v1/agent-c/block")
 def post_agent_c_block(
     payload: BlockRequest,
-    x_agent_role: Optional[str] = Header(default=None)
+    response: Response,
+    x_agent_role: Optional[str] = Header(default=None),
+    x_agent_did: Optional[str] = Header(default=None),
+    x_token_jti: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
 ):
-    """Agent C - Incident Responder: block suspicious IP.
-    
-    Validates IP address format (422 if invalid).
-    Requires permission: 'block_ip' on the requested IP.
-    """
-    # 1. Validate IP format using standard ipaddress module
+    """Agent C - Incident Responder: block suspicious IP. Requires 'block_ip' on requested IP."""
     try:
         ipaddress.ip_address(payload.ip)
     except ValueError:
@@ -118,13 +133,19 @@ def post_agent_c_block(
             detail=f"Invalid IP address format: '{payload.ip}'"
         )
 
-    # 2. Check policy authorization (OPA)
-    authorize(x_agent_role, "block_ip", payload.ip)
+    decision_ms = audit.enforce(
+        db=db,
+        role=x_agent_role,
+        action="block_ip",
+        resource=payload.ip,
+        agent_did=x_agent_did,
+        token_jti=x_token_jti,
+        auth_header=authorization,
+    )
+    response.headers["X-Decision-Time-ms"] = f"{decision_ms:.2f}"
 
-    # 3. Execute action via simulated SOC tools (with second-line defense check)
     try:
-        result = soc_tools.block_ip(payload.ip)
-        return result
+        return soc_tools.block_ip(payload.ip)
     except PermissionError as err:
         raise HTTPException(status_code=403, detail=str(err))
 
@@ -132,23 +153,31 @@ def post_agent_c_block(
 @app.post("/api/v1/agent-c/isolate")
 def post_agent_c_isolate(
     payload: IsolateRequest,
-    x_agent_role: Optional[str] = Header(default=None)
+    response: Response,
+    x_agent_role: Optional[str] = Header(default=None),
+    x_agent_did: Optional[str] = Header(default=None),
+    x_token_jti: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
 ):
-    """Agent C - Incident Responder: isolate compromised host.
-    
-    Requires permission: 'isolate_host' on the target host.
-    """
+    """Agent C - Incident Responder: isolate compromised host."""
     host = payload.host.strip()
     if not host:
         raise HTTPException(status_code=422, detail="Host parameter cannot be empty")
 
-    # 1. Check policy authorization (OPA)
-    authorize(x_agent_role, "isolate_host", host)
+    decision_ms = audit.enforce(
+        db=db,
+        role=x_agent_role,
+        action="isolate_host",
+        resource=host,
+        agent_did=x_agent_did,
+        token_jti=x_token_jti,
+        auth_header=authorization,
+    )
+    response.headers["X-Decision-Time-ms"] = f"{decision_ms:.2f}"
 
-    # 2. Execute action via simulated SOC tools (with second-line defense check)
     try:
-        result = soc_tools.isolate_host(host)
-        return result
+        return soc_tools.isolate_host(host)
     except PermissionError as err:
         raise HTTPException(status_code=403, detail=str(err))
 
@@ -160,3 +189,86 @@ def get_soc_blocked():
         "blocked_ips": soc_tools.list_blocked(),
         "isolated_hosts": soc_tools.list_isolated()
     }
+
+
+# =====================================================================
+# Admin Endpoints (Secured with x-admin-key)
+# =====================================================================
+
+
+@app.get("/api/v1/audit")
+def get_audit_logs(
+    decision: Optional[str] = Query(default=None),
+    agent: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Retrieve filtered audit logs."""
+    query = db.query(AuditLog)
+    if decision:
+        query = query.filter(AuditLog.decision == decision.upper())
+    if agent:
+        query = query.filter((AuditLog.agent_did == agent) | (AuditLog.role == agent))
+
+    records = query.order_by(AuditLog.id.desc()).limit(limit).all()
+    return records
+
+
+@app.get("/api/v1/audit/stats")
+def get_audit_stats(
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Retrieve statistical summary of decisions, latencies, and agent activity."""
+    total = db.query(AuditLog).count()
+    allowed = db.query(AuditLog).filter(AuditLog.decision == "ALLOW").count()
+    denied = db.query(AuditLog).filter(AuditLog.decision == "DENY").count()
+    errors = db.query(AuditLog).filter(AuditLog.decision == "ERROR").count()
+
+    avg_latency = db.query(func.avg(AuditLog.latency_ms)).scalar() or 0.0
+
+    agent_counts = (
+        db.query(AuditLog.role, func.count(AuditLog.id))
+        .filter(AuditLog.role.isnot(None))
+        .group_by(AuditLog.role)
+        .all()
+    )
+    per_agent = {role: count for role, count in agent_counts}
+
+    return {
+        "total": total,
+        "allowed": allowed,
+        "denied": denied,
+        "errors": errors,
+        "per_agent": per_agent,
+        "average_latency_ms": round(float(avg_latency), 2),
+    }
+
+
+@app.get("/api/v1/audit/verify-chain")
+def get_verify_chain(
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Verify cryptographic SHA-256 hash chain integrity across all audit records."""
+    return audit.verify_chain(db)
+
+
+@app.post("/api/v1/tokens/revoke")
+def revoke_token(
+    payload: RevokeTokenRequest,
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Revoke a capability token by its JTI (JWT ID)."""
+    existing = db.query(RevokedToken).filter(RevokedToken.jti == payload.jti).first()
+    if not existing:
+        revocation = RevokedToken(
+            jti=payload.jti,
+            revoked_at=datetime.now(timezone.utc),
+        )
+        db.add(revocation)
+        db.commit()
+
+    return {"status": "revoked", "jti": payload.jti}
