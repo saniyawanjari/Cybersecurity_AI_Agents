@@ -1,0 +1,1 @@
+Phase 6 - package.json, vite.config.ts, tsconfig.json, index.html are created here in Phase 6.
