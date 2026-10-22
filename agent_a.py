@@ -1,45 +1,62 @@
-"""Agent A - Log Analyst.
+"""Agent A - Log Analyst (Phase 2).
 
-It READS logs and REPORTS suspicious IPs. It has no code to block anything:
-suggesting is separate from executing (executing belongs to Agent C, later).
+Reads log files and identifies IP addresses with repeated failed logins.
+Uses pandas and regex to count occurrences.
+Note: Agent A has read-only access and cannot execute any remediation actions.
 """
 import re
 from pathlib import Path
+from typing import Union
 
 import pandas as pd
 
-# Always find the log file next to this script, no matter where we run from.
+# Default log file path next to this script
 LOG_FILE = Path(__file__).parent / "server_logs.txt"
 
-# Report every IP with this many (or more) failed logins.
+# Default threshold for suspicious failed attempts
 THRESHOLD = 3
 
-# Matches e.g. "Failed password for root from 203.0.113.5 port ..."
-# and           "Failed password for invalid user admin from 203.0.113.5 port ..."
-#   (?:invalid user )?  -> optional words "invalid user "
-#   \S+                 -> the username (any non-space text)
-#   (\d{1,3}(?:\.\d{1,3}){3}) -> the IP address, captured as group 1
+# Regex to capture IP addresses from failed SSH login attempts
+# Matches lines like: "Failed password for root from 203.0.113.5 port ..."
+# or "Failed password for invalid user admin from 203.0.113.5 port ..."
 FAILED_LOGIN_PATTERN = re.compile(
-    r"Failed password for (?:invalid user )?\S+ from (\d{1,3}(?:\.\d{1,3}){3})"
+    r"Failed password .* from (\d{1,3}(?:\.\d{1,3}){3})"
 )
 
 
-def run_analysis() -> dict:
-    """Read the log, count failed logins per IP, return IPs at or over THRESHOLD."""
-    ips = []
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
+def analyze_logs(path: Union[str, Path] = LOG_FILE, threshold: int = 3) -> dict[str, int]:
+    """Read a log file, count failed logins per IP, and return IPs with count >= threshold.
+    
+    Args:
+        path: Path to the log file.
+        threshold: Minimum number of failed logins to be considered suspicious.
+        
+    Returns:
+        dict: Mapping of {ip: count} for all IPs meeting or exceeding the threshold.
+    """
+    log_path = Path(path)
+    if not log_path.exists():
+        return {}
+
+    ips: list[str] = []
+    with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
             match = FAILED_LOGIN_PATTERN.search(line)
             if match:
                 ips.append(match.group(1))
 
-    # No failed logins at all -> empty report.
+    # If no failed logins found at all, return empty dict
     if not ips:
         return {}
 
-    # pandas: turn the list into a Series and count how often each IP appears.
+    # Use pandas to count occurrences of each IP
     counts = pd.Series(ips).value_counts()
-    suspicious = counts[counts >= THRESHOLD]
+    suspicious = counts[counts >= threshold]
 
-    # Convert numpy integers to normal Python ints so FastAPI can make JSON.
+    # Convert to native Python int for clean JSON serialization
     return {ip: int(n) for ip, n in suspicious.items()}
+
+
+def run_analysis() -> dict[str, int]:
+    """Convenience wrapper for backwards compatibility with Phase 1."""
+    return analyze_logs(LOG_FILE, THRESHOLD)
